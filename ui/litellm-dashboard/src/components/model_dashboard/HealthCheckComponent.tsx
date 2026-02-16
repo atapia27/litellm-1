@@ -1,13 +1,16 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useRef, useMemo, useCallback } from "react";
 import { Title, Text, Button, Badge } from "@tremor/react";
 import { Modal } from "antd";
 import { Button as AntdButton } from "antd";
+import { useQueryClient } from "@tanstack/react-query";
 import { ModelDataTable } from "./table";
 import { healthCheckColumns } from "./health_check_columns";
 import { errorPatterns } from "@/utils/errorPatterns";
-import { individualModelHealthCheckCall, latestHealthChecksCall } from "../networking";
 import { Table as TableInstance } from "@tanstack/react-table";
 import { Team } from "../key_team_helpers/key_list";
+import { useLatestModelHealthChecks } from "@/app/(dashboard)/hooks/modelHealthCheck/useLatestModelHealthChecks";
+import { useModelHealthCheckQueries } from "@/app/(dashboard)/hooks/modelHealthCheck/useModelHealthCheckQueries";
+import { latestModelHealthChecksKeys } from "@/app/(dashboard)/hooks/modelHealthCheck/queryKeys";
 
 interface HealthStatus {
   status: string;
@@ -28,6 +31,103 @@ interface HealthCheckComponentProps {
   teams?: Team[] | null;
 }
 
+function extractMeaningfulError(error: any): string {
+  if (!error) return "Health check failed";
+
+  let errorStr = typeof error === "string" ? error : JSON.stringify(error);
+
+  const directPatternMatch = errorStr.match(/(\w+Error):\s*(\d{3})/i);
+  if (directPatternMatch) {
+    return `${directPatternMatch[1]}: ${directPatternMatch[2]}`;
+  }
+
+  const errorTypeMatch = errorStr.match(
+    /(AuthenticationError|RateLimitError|BadRequestError|InternalServerError|TimeoutError|NotFoundError|ForbiddenError|ServiceUnavailableError|BadGatewayError|ContentPolicyViolationError|\w+Error)/i,
+  );
+  const statusCodeMatch = errorStr.match(/\b(400|401|403|404|408|429|500|502|503|504)\b/);
+
+  if (errorTypeMatch && statusCodeMatch) {
+    return `${errorTypeMatch[1]}: ${statusCodeMatch[1]}`;
+  }
+
+  if (statusCodeMatch) {
+    const statusCode = statusCodeMatch[1];
+    const statusToError: { [key: string]: string } = {
+      "400": "BadRequestError",
+      "401": "AuthenticationError",
+      "403": "ForbiddenError",
+      "404": "NotFoundError",
+      "408": "TimeoutError",
+      "429": "RateLimitError",
+      "500": "InternalServerError",
+      "502": "BadGatewayError",
+      "503": "ServiceUnavailableError",
+      "504": "GatewayTimeoutError",
+    };
+    return `${statusToError[statusCode]}: ${statusCode}`;
+  }
+
+  if (errorTypeMatch) {
+    const errorType = errorTypeMatch[1];
+    const errorToStatus: { [key: string]: string } = {
+      AuthenticationError: "401",
+      RateLimitError: "429",
+      BadRequestError: "400",
+      InternalServerError: "500",
+      TimeoutError: "408",
+      NotFoundError: "404",
+      ForbiddenError: "403",
+      ServiceUnavailableError: "503",
+      BadGatewayError: "502",
+      GatewayTimeoutError: "504",
+      ContentPolicyViolationError: "400",
+    };
+    const mappedStatus = errorToStatus[errorType];
+    if (mappedStatus) {
+      return `${errorType}: ${mappedStatus}`;
+    }
+    return errorType;
+  }
+
+  for (const { pattern, replacement } of errorPatterns) {
+    if (pattern.test(errorStr)) {
+      return replacement;
+    }
+  }
+
+  if (/missing.*api.*key|invalid.*key|unauthorized/i.test(errorStr)) {
+    return "AuthenticationError: 401";
+  }
+  if (/rate.*limit|too.*many.*requests/i.test(errorStr)) {
+    return "RateLimitError: 429";
+  }
+  if (/timeout|timed.*out/i.test(errorStr)) {
+    return "TimeoutError: 408";
+  }
+  if (/not.*found/i.test(errorStr)) {
+    return "NotFoundError: 404";
+  }
+  if (/forbidden|access.*denied/i.test(errorStr)) {
+    return "ForbiddenError: 403";
+  }
+  if (/internal.*server.*error/i.test(errorStr)) {
+    return "InternalServerError: 500";
+  }
+
+  const cleaned = errorStr
+    .replace(/[\n\r]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const sentences = cleaned.split(/[.!?]/);
+  const firstSentence = sentences[0]?.trim();
+
+  if (firstSentence && firstSentence.length > 0) {
+    return firstSentence.length > 100 ? firstSentence.substring(0, 97) + "..." : firstSentence;
+  }
+
+  return cleaned.length > 100 ? cleaned.substring(0, 97) + "..." : cleaned;
+}
+
 const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
   accessToken,
   modelData,
@@ -36,7 +136,18 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
   setSelectedModelId,
   teams,
 }) => {
-  const [modelHealthStatuses, setModelHealthStatuses] = useState<{ [key: string]: HealthStatus }>({});
+  const queryClient = useQueryClient();
+  const modelIds = useMemo(
+    () =>
+      (modelData?.data ?? [])
+        .map((model: any) => model.model_info?.id)
+        .filter(Boolean) as string[],
+    [modelData],
+  );
+
+  const { data: latestData, refetch: refetchLatest } = useLatestModelHealthChecks(accessToken);
+  const perModelQueries = useModelHealthCheckQueries(modelIds, accessToken);
+
   const [selectedModelsForHealth, setSelectedModelsForHealth] = useState<string[]>([]);
   const [allModelsSelected, setAllModelsSelected] = useState<boolean>(false);
   const [errorModalVisible, setErrorModalVisible] = useState(false);
@@ -53,382 +164,135 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
 
   const healthTableRef = useRef<TableInstance<any>>(null);
 
-  // Initialize health statuses on component mount (keyed by model id)
-  useEffect(() => {
-    if (!accessToken || !modelData?.data) return;
+  const modelHealthStatuses = useMemo((): { [key: string]: HealthStatus } => {
+    const statuses: { [key: string]: HealthStatus } = {};
 
-    const initializeHealthStatuses = async () => {
-      const healthStatusMap: { [key: string]: HealthStatus } = {};
+    for (const modelId of modelIds) {
+      statuses[modelId] = {
+        status: "none",
+        lastCheck: "None",
+        lastSuccess: "None",
+        loading: false,
+        error: undefined,
+        fullError: undefined,
+        successResponse: undefined,
+      };
+    }
 
-      // Initialize all models with default state using model ids
-      modelData.data.forEach((model: any) => {
-        const modelId = model.model_info?.id;
-        if (modelId) {
-          healthStatusMap[modelId] = {
-            status: "none",
-            lastCheck: "None",
-            lastSuccess: "None",
-            loading: false,
-            error: undefined,
-            fullError: undefined,
-            successResponse: undefined,
-          };
-        }
-      });
+    const latest = latestData?.latest_health_checks;
+    if (latest && typeof latest === "object") {
+      for (const modelId of modelIds) {
+        const checkData = latest[modelId];
+        if (!checkData) continue;
+        const modelExists = (modelData?.data ?? []).some((m: any) => m.model_info?.id === modelId);
+        if (!modelExists) continue;
 
-      try {
-        const latestHealthChecks = await latestHealthChecksCall(accessToken);
+        const fullError = checkData.error_message ?? undefined;
+        statuses[modelId] = {
+          status: checkData.status ?? "unknown",
+          lastCheck: checkData.checked_at ? new Date(checkData.checked_at).toLocaleString() : "None",
+          lastSuccess:
+            checkData.status === "healthy" && checkData.checked_at
+              ? new Date(checkData.checked_at).toLocaleString()
+              : "None",
+          loading: false,
+          error: fullError ? extractMeaningfulError(fullError) : undefined,
+          fullError,
+          successResponse: checkData.status === "healthy" ? checkData : undefined,
+        };
+      }
+    }
 
-        // Override with actual database data if it exists (latest_health_checks is keyed by model_id)
+    for (const modelId of modelIds) {
+      const q = perModelQueries[modelId];
+      if (!q) continue;
+
+      if (q.isFetching) {
+        statuses[modelId] = {
+          ...statuses[modelId],
+          loading: true,
+          status: "checking",
+        };
+        continue;
+      }
+
+      if (q.isFetched && q.error) {
+        const rawError = q.error instanceof Error ? q.error.message : String(q.error);
+        statuses[modelId] = {
+          ...statuses[modelId],
+          status: "unhealthy",
+          lastCheck: q.dataUpdatedAt ? q.dataUpdatedAt.toLocaleString() : statuses[modelId].lastCheck,
+          lastSuccess: statuses[modelId].lastSuccess ?? "None",
+          loading: false,
+          error: extractMeaningfulError(rawError),
+          fullError: rawError,
+        };
+        continue;
+      }
+
+      if (q.isFetched && q.data) {
+        const response = q.data;
+        const currentTime = q.dataUpdatedAt ? q.dataUpdatedAt.toLocaleString() : new Date().toLocaleString();
         if (
-          latestHealthChecks &&
-          latestHealthChecks.latest_health_checks &&
-          typeof latestHealthChecks.latest_health_checks === "object"
+          response.unhealthy_count != null &&
+          response.unhealthy_count > 0 &&
+          response.unhealthy_endpoints &&
+          response.unhealthy_endpoints.length > 0
         ) {
-          Object.entries(latestHealthChecks.latest_health_checks).forEach(([modelId, checkData]: [string, any]) => {
-            if (!checkData) return;
-
-            // Key is model_id from the backend (guaranteed by DB schema)
-            const modelExists = modelData.data.some((m: any) => m.model_info?.id === modelId);
-            if (!modelExists) return;
-
-            const fullError = checkData.error_message || undefined;
-
-            healthStatusMap[modelId] = {
-                status: checkData.status || "unknown",
-                lastCheck: checkData.checked_at ? new Date(checkData.checked_at).toLocaleString() : "None",
-                lastSuccess:
-                  checkData.status === "healthy"
-                    ? checkData.checked_at
-                      ? new Date(checkData.checked_at).toLocaleString()
-                      : "None"
-                    : "None",
-                loading: false,
-                error: fullError ? extractMeaningfulError(fullError) : undefined,
-                fullError: fullError,
-                successResponse: checkData.status === "healthy" ? checkData : undefined,
-              };
-          });
-        }
-      } catch (healthError) {
-        console.warn("Failed to load health check history (using default states):", healthError);
-      }
-
-      setModelHealthStatuses(healthStatusMap);
-    };
-
-    initializeHealthStatuses();
-  }, [accessToken, modelData]);
-
-  // Helper function to extract meaningful error information
-  const extractMeaningfulError = (error: any): string => {
-    if (!error) return "Health check failed";
-
-    let errorStr = typeof error === "string" ? error : JSON.stringify(error);
-
-    // First, look for explicit "ErrorType: StatusCode" patterns
-    const directPatternMatch = errorStr.match(/(\w+Error):\s*(\d{3})/i);
-    if (directPatternMatch) {
-      return `${directPatternMatch[1]}: ${directPatternMatch[2]}`;
-    }
-
-    // Look for error types and status codes separately, then combine them
-    const errorTypeMatch = errorStr.match(
-      /(AuthenticationError|RateLimitError|BadRequestError|InternalServerError|TimeoutError|NotFoundError|ForbiddenError|ServiceUnavailableError|BadGatewayError|ContentPolicyViolationError|\w+Error)/i,
-    );
-    const statusCodeMatch = errorStr.match(/\b(400|401|403|404|408|429|500|502|503|504)\b/);
-
-    if (errorTypeMatch && statusCodeMatch) {
-      return `${errorTypeMatch[1]}: ${statusCodeMatch[1]}`;
-    }
-
-    // If we have a status code but no clear error type, map it
-    if (statusCodeMatch) {
-      const statusCode = statusCodeMatch[1];
-      const statusToError: { [key: string]: string } = {
-        "400": "BadRequestError",
-        "401": "AuthenticationError",
-        "403": "ForbiddenError",
-        "404": "NotFoundError",
-        "408": "TimeoutError",
-        "429": "RateLimitError",
-        "500": "InternalServerError",
-        "502": "BadGatewayError",
-        "503": "ServiceUnavailableError",
-        "504": "GatewayTimeoutError",
-      };
-      return `${statusToError[statusCode]}: ${statusCode}`;
-    }
-
-    // If we have an error type but no status code, map error type to expected status code
-    if (errorTypeMatch) {
-      const errorType = errorTypeMatch[1];
-      const errorToStatus: { [key: string]: string } = {
-        AuthenticationError: "401",
-        RateLimitError: "429",
-        BadRequestError: "400",
-        InternalServerError: "500",
-        TimeoutError: "408",
-        NotFoundError: "404",
-        ForbiddenError: "403",
-        ServiceUnavailableError: "503",
-        BadGatewayError: "502",
-        GatewayTimeoutError: "504",
-        ContentPolicyViolationError: "400",
-      };
-
-      const mappedStatus = errorToStatus[errorType];
-      if (mappedStatus) {
-        return `${errorType}: ${mappedStatus}`;
-      }
-      return errorType;
-    }
-
-    // Check for specific error patterns from errorPatterns
-    for (const { pattern, replacement } of errorPatterns) {
-      if (pattern.test(errorStr)) {
-        return replacement;
-      }
-    }
-
-    // Look for common error keywords and provide meaningful names with status codes
-    if (/missing.*api.*key|invalid.*key|unauthorized/i.test(errorStr)) {
-      return "AuthenticationError: 401";
-    }
-    if (/rate.*limit|too.*many.*requests/i.test(errorStr)) {
-      return "RateLimitError: 429";
-    }
-    if (/timeout|timed.*out/i.test(errorStr)) {
-      return "TimeoutError: 408";
-    }
-    if (/not.*found/i.test(errorStr)) {
-      return "NotFoundError: 404";
-    }
-    if (/forbidden|access.*denied/i.test(errorStr)) {
-      return "ForbiddenError: 403";
-    }
-    if (/internal.*server.*error/i.test(errorStr)) {
-      return "InternalServerError: 500";
-    }
-
-    // Fallback: clean up the error string and return first meaningful part
-    const cleaned = errorStr
-      .replace(/[\n\r]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    // Try to get first meaningful sentence or phrase
-    const sentences = cleaned.split(/[.!?]/);
-    const firstSentence = sentences[0]?.trim();
-
-    if (firstSentence && firstSentence.length > 0) {
-      return firstSentence.length > 100 ? firstSentence.substring(0, 97) + "..." : firstSentence;
-    }
-
-    return cleaned.length > 100 ? cleaned.substring(0, 97) + "..." : cleaned;
-  };
-
-  const runIndividualHealthCheck = async (modelId: string) => {
-    if (!accessToken) return;
-
-    setModelHealthStatuses((prev) => ({
-      ...prev,
-      [modelId]: {
-        ...prev[modelId],
-        loading: true,
-        status: "checking",
-      },
-    }));
-
-    try {
-      const response = await individualModelHealthCheckCall(accessToken, modelId);
-      const currentTime = new Date().toLocaleString();
-
-      if (response.unhealthy_count > 0 && response.unhealthy_endpoints && response.unhealthy_endpoints.length > 0) {
-        const rawError = response.unhealthy_endpoints[0]?.error || "Health check failed";
-        const errorMessage = extractMeaningfulError(rawError);
-        setModelHealthStatuses((prev) => ({
-          ...prev,
-          [modelId]: {
+          const rawError = response.unhealthy_endpoints[0]?.error ?? "Health check failed";
+          statuses[modelId] = {
+            ...statuses[modelId],
             status: "unhealthy",
             lastCheck: currentTime,
-            lastSuccess: prev[modelId]?.lastSuccess || "None",
+            lastSuccess: statuses[modelId].lastSuccess ?? "None",
             loading: false,
-            error: errorMessage,
+            error: extractMeaningfulError(rawError),
             fullError: rawError,
-          },
-        }));
-      } else {
-        setModelHealthStatuses((prev) => ({
-          ...prev,
-          [modelId]: {
+          };
+        } else {
+          statuses[modelId] = {
+            ...statuses[modelId],
             status: "healthy",
             lastCheck: currentTime,
             lastSuccess: currentTime,
             loading: false,
             successResponse: response,
-          },
-        }));
-      }
-
-      try {
-        const latestHealthChecks = await latestHealthChecksCall(accessToken);
-        const checkData = latestHealthChecks.latest_health_checks?.[modelId];
-
-        if (checkData) {
-          const fullError = checkData.error_message || undefined;
-          setModelHealthStatuses((prev) => ({
-            ...prev,
-            [modelId]: {
-              status: checkData.status || prev[modelId]?.status || "unknown",
-              lastCheck: checkData.checked_at
-                ? new Date(checkData.checked_at).toLocaleString()
-                : prev[modelId]?.lastCheck || "None",
-              lastSuccess:
-                checkData.status === "healthy"
-                  ? checkData.checked_at
-                    ? new Date(checkData.checked_at).toLocaleString()
-                    : prev[modelId]?.lastSuccess || "None"
-                  : prev[modelId]?.lastSuccess || "None",
-              loading: false,
-              error: fullError ? extractMeaningfulError(fullError) : prev[modelId]?.error,
-              fullError: fullError || prev[modelId]?.fullError,
-              successResponse: checkData.status === "healthy" ? checkData : prev[modelId]?.successResponse,
-            },
-          }));
+          };
         }
-      } catch (dbError) {
-        console.debug("Could not fetch updated status from database (non-critical):", dbError);
       }
-    } catch (error) {
-      const currentTime = new Date().toLocaleString();
-      const rawError = error instanceof Error ? error.message : String(error);
-      const errorMessage = extractMeaningfulError(rawError);
-      setModelHealthStatuses((prev) => ({
-        ...prev,
-        [modelId]: {
-          status: "unhealthy",
-          lastCheck: currentTime,
-          lastSuccess: prev[modelId]?.lastSuccess || "None",
-          loading: false,
-          error: errorMessage,
-          fullError: rawError,
-        },
-      }));
     }
-  };
 
-  const runAllHealthChecks = async () => {
-    const modelsToCheck = selectedModelsForHealth.length > 0 ? selectedModelsForHealth : all_models_on_proxy;
+    return statuses;
+  }, [modelIds, latestData, perModelQueries, modelData?.data]);
 
-    const loadingStatuses = modelsToCheck.reduce(
-      (acc, modelId) => {
-        acc[modelId] = {
-          ...modelHealthStatuses[modelId],
-          loading: true,
-          status: "checking",
-        };
-        return acc;
-      },
-      {} as typeof modelHealthStatuses,
-    );
-
-    setModelHealthStatuses((prev) => ({ ...prev, ...loadingStatuses }));
-
-    const healthCheckResults: { [key: string]: any } = {};
-
-    const healthCheckPromises = modelsToCheck.map(async (modelId) => {
+  const runIndividualHealthCheck = useCallback(
+    async (modelId: string) => {
       if (!accessToken) return;
-
-      try {
-        const response = await individualModelHealthCheckCall(accessToken, modelId);
-        healthCheckResults[modelId] = response;
-
-        const currentTime = new Date().toLocaleString();
-        if (response.unhealthy_count > 0 && response.unhealthy_endpoints && response.unhealthy_endpoints.length > 0) {
-          const rawError = response.unhealthy_endpoints[0]?.error || "Health check failed";
-          const errorMessage = extractMeaningfulError(rawError);
-          setModelHealthStatuses((prev) => ({
-            ...prev,
-            [modelId]: {
-              status: "unhealthy",
-              lastCheck: currentTime,
-              lastSuccess: prev[modelId]?.lastSuccess || "None",
-              loading: false,
-              error: errorMessage,
-              fullError: rawError,
-            },
-          }));
-        } else {
-          setModelHealthStatuses((prev) => ({
-            ...prev,
-            [modelId]: {
-              status: "healthy",
-              lastCheck: currentTime,
-              lastSuccess: currentTime,
-              loading: false,
-              successResponse: response,
-            },
-          }));
-        }
-      } catch (error) {
-        console.error(`Health check failed for model id ${modelId}:`, error);
-        const currentTime = new Date().toLocaleString();
-        const rawError = error instanceof Error ? error.message : String(error);
-        const errorMessage = extractMeaningfulError(rawError);
-        setModelHealthStatuses((prev) => ({
-          ...prev,
-          [modelId]: {
-            status: "unhealthy",
-            lastCheck: currentTime,
-            lastSuccess: prev[modelId]?.lastSuccess || "None",
-            loading: false,
-            error: errorMessage,
-            fullError: rawError,
-          },
-        }));
+      const q = perModelQueries[modelId];
+      if (q) {
+        await q.refetch();
+        queryClient.invalidateQueries({ queryKey: latestModelHealthChecksKeys.lists() });
       }
-    });
+    },
+    [accessToken, perModelQueries, queryClient],
+  );
 
-    await Promise.allSettled(healthCheckPromises);
-
-    try {
-      if (!accessToken) return;
-      const latestHealthChecks = await latestHealthChecksCall(accessToken);
-
-      if (latestHealthChecks.latest_health_checks) {
-        Object.entries(latestHealthChecks.latest_health_checks).forEach(([modelId, checkData]: [string, any]) => {
-          if (modelsToCheck.includes(modelId) && checkData) {
-            const fullError = checkData.error_message || undefined;
-            setModelHealthStatuses((prev) => {
-              const currentStatus = prev[modelId];
-              return {
-                ...prev,
-                [modelId]: {
-                  status: checkData.status || currentStatus?.status || "unknown",
-                  lastCheck: checkData.checked_at
-                    ? new Date(checkData.checked_at).toLocaleString()
-                    : currentStatus?.lastCheck || "None",
-                  lastSuccess:
-                    checkData.status === "healthy"
-                      ? checkData.checked_at
-                        ? new Date(checkData.checked_at).toLocaleString()
-                        : currentStatus?.lastSuccess || "None"
-                      : currentStatus?.lastSuccess || "None",
-                  loading: false,
-                  error: fullError ? extractMeaningfulError(fullError) : currentStatus?.error,
-                  fullError: fullError || currentStatus?.fullError,
-                  successResponse: checkData.status === "healthy" ? checkData : currentStatus?.successResponse,
-                },
-              };
-            });
-          }
-        });
-      }
-    } catch (dbError) {
-      console.warn("Failed to fetch updated health statuses from database (non-critical):", dbError);
-    }
-  };
+  const runAllHealthChecks = useCallback(async () => {
+    const modelsToCheck =
+      selectedModelsForHealth.length > 0 ? selectedModelsForHealth : all_models_on_proxy;
+    const refetches = modelsToCheck
+      .map((id) => perModelQueries[id]?.refetch)
+      .filter((r): r is () => Promise<unknown> => typeof r === "function");
+    await Promise.all(refetches.map((r) => r()));
+    queryClient.invalidateQueries({ queryKey: latestModelHealthChecksKeys.lists() });
+    await refetchLatest();
+  }, [
+    selectedModelsForHealth,
+    all_models_on_proxy,
+    perModelQueries,
+    queryClient,
+    refetchLatest,
+  ]);
 
   const handleModelSelection = (modelId: string, checked: boolean) => {
     if (checked) {
@@ -490,6 +354,8 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
     setSelectedSuccessDetails(null);
   };
 
+  const anyLoading = Object.values(modelHealthStatuses).some((s) => s.loading);
+
   return (
     <div>
       <div className="mb-6">
@@ -510,7 +376,7 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
               size="sm"
               variant="secondary"
               onClick={runAllHealthChecks}
-              disabled={Object.values(modelHealthStatuses).some((status) => status.loading)}
+              disabled={anyLoading}
               className="px-3 py-1 text-sm"
             >
               {selectedModelsForHealth.length > 0 && selectedModelsForHealth.length < all_models_on_proxy.length
@@ -537,10 +403,10 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
             setSelectedModelId,
             teams,
           )}
-          data={modelData.data.map((model: any) => {
+          data={(modelData?.data ?? []).map((model: any) => {
             const modelId = model.model_info?.id;
             const healthStatus = modelId ? modelHealthStatuses[modelId] : null;
-            const status = healthStatus || {
+            const status = healthStatus ?? {
               status: "none",
               lastCheck: "None",
               loading: false,
@@ -552,7 +418,7 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
               litellm_model_name: model.litellm_model_name,
               health_status: status.status,
               last_check: status.lastCheck,
-              last_success: status.lastSuccess || "None",
+              last_success: status.lastSuccess ?? "None",
               health_loading: status.loading,
               health_error: status.error,
               health_full_error: status.fullError,
@@ -562,7 +428,6 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
         />
       </div>
 
-      {/* Error Modal */}
       <Modal
         title={selectedErrorDetails ? `Health Check Error - ${selectedErrorDetails.modelName}` : "Error Details"}
         open={errorModalVisible}
@@ -582,7 +447,6 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
                 <Text className="text-red-800">{selectedErrorDetails.cleanedError}</Text>
               </div>
             </div>
-
             <div>
               <Text className="font-medium">Full Error Details:</Text>
               <div className="mt-2 p-3 bg-gray-50 border border-gray-200 rounded-md max-h-96 overflow-y-auto">
@@ -593,7 +457,6 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
         )}
       </Modal>
 
-      {/* Success Modal */}
       <Modal
         title={
           selectedSuccessDetails ? `Health Check Response - ${selectedSuccessDetails.modelName}` : "Response Details"
@@ -615,7 +478,6 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
                 <Text className="text-green-800">Health check passed successfully</Text>
               </div>
             </div>
-
             <div>
               <Text className="font-medium">Response Details:</Text>
               <div className="mt-2 p-3 bg-gray-50 border border-gray-200 rounded-md max-h-96 overflow-y-auto">

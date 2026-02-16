@@ -1,5 +1,7 @@
 /* @vitest-environment jsdom */
-import { act, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, render, screen, waitFor } from "@testing-library/react";
+import React from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import HealthCheckComponent from "./HealthCheckComponent";
 
@@ -10,6 +12,16 @@ vi.mock("../networking", () => ({
   individualModelHealthCheckCall: (...args: unknown[]) => mockIndividualModelHealthCheckCall(...args),
   latestHealthChecksCall: (...args: unknown[]) => mockLatestHealthChecksCall(...args),
 }));
+
+const createQueryClient = () =>
+  new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+  });
+
+function renderWithQueryClient(ui: React.ReactElement) {
+  const queryClient = createQueryClient();
+  return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
+}
 
 describe("HealthCheckComponent", () => {
   const getDisplayModelName = (model: { model_name?: string }) => model.model_name ?? "";
@@ -37,7 +49,7 @@ describe("HealthCheckComponent", () => {
     };
 
     await act(async () => {
-      render(
+      renderWithQueryClient(
         <HealthCheckComponent
           accessToken="token"
           modelData={modelData}
@@ -67,7 +79,7 @@ describe("HealthCheckComponent", () => {
       ],
     };
 
-    render(
+    renderWithQueryClient(
       <HealthCheckComponent
         accessToken="token-123"
         modelData={modelData}
@@ -75,6 +87,10 @@ describe("HealthCheckComponent", () => {
         getDisplayModelName={getDisplayModelName}
       />,
     );
+
+    await waitFor(() => {
+      expect(mockLatestHealthChecksCall).toHaveBeenCalledWith("token-123");
+    });
 
     const runButtons = screen.getAllByTestId("run-health-check-btn");
     expect(runButtons.length).toBeGreaterThanOrEqual(1);
@@ -96,14 +112,14 @@ describe("HealthCheckComponent", () => {
     it("should show status from latest_health_checks when keys match model ids", async () => {
       const modelData = {
         data: [
-          { 
-            model_name: "gpt-4", 
-            model_info: { id: "id-alpha" }, 
-            litellm_model_name: "gpt-4",  
+          {
+            model_name: "gpt-4",
+            model_info: { id: "id-alpha" },
+            litellm_model_name: "gpt-4",
           },
-          { 
-            model_name: "gpt-4", 
-            model_info: { id: "id-beta" }, 
+          {
+            model_name: "gpt-4",
+            model_info: { id: "id-beta" },
             litellm_model_name: "gpt-4",
           },
         ],
@@ -125,7 +141,7 @@ describe("HealthCheckComponent", () => {
       });
 
       await act(async () => {
-        render(
+        renderWithQueryClient(
           <HealthCheckComponent
             accessToken="token"
             modelData={modelData}
@@ -134,15 +150,16 @@ describe("HealthCheckComponent", () => {
           />,
         );
       });
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 0));
-      });
 
-      expect(mockLatestHealthChecksCall).toHaveBeenCalledWith("token");
-      const healthyBadges = screen.getAllByText("healthy");
-      const unhealthyBadges = screen.getAllByText("unhealthy");
-      expect(healthyBadges.length).toBeGreaterThanOrEqual(1);
-      expect(unhealthyBadges.length).toBeGreaterThanOrEqual(1);
+      await waitFor(() => {
+        expect(mockLatestHealthChecksCall).toHaveBeenCalledWith("token");
+      });
+      await waitFor(() => {
+        const healthyBadges = screen.getAllByText("healthy");
+        const unhealthyBadges = screen.getAllByText("unhealthy");
+        expect(healthyBadges.length).toBeGreaterThanOrEqual(1);
+        expect(unhealthyBadges.length).toBeGreaterThanOrEqual(1);
+      });
     });
 
     it("should skip latest_health_checks entries whose key is not a known model id", async () => {
@@ -172,7 +189,7 @@ describe("HealthCheckComponent", () => {
       });
 
       await act(async () => {
-        render(
+        renderWithQueryClient(
           <HealthCheckComponent
             accessToken="token"
             modelData={modelData}
@@ -181,11 +198,13 @@ describe("HealthCheckComponent", () => {
           />,
         );
       });
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 0));
-      });
 
-      expect(screen.getByText("healthy")).toBeInTheDocument();
+      await waitFor(() => {
+        expect(mockLatestHealthChecksCall).toHaveBeenCalledWith("token");
+      });
+      await waitFor(() => {
+        expect(screen.getByText("healthy")).toBeInTheDocument();
+      });
       expect(screen.queryByText("unhealthy")).not.toBeInTheDocument();
     });
 
@@ -211,7 +230,7 @@ describe("HealthCheckComponent", () => {
       });
 
       await act(async () => {
-        render(
+        renderWithQueryClient(
           <HealthCheckComponent
             accessToken="token"
             modelData={modelData}
@@ -220,12 +239,14 @@ describe("HealthCheckComponent", () => {
           />,
         );
       });
-      await act(async () => {
-        await new Promise((r) => setTimeout(r, 0));
-      });
 
+      await waitFor(() => {
+        expect(mockLatestHealthChecksCall).toHaveBeenCalledWith("token");
+      });
+      await waitFor(() => {
+        expect(screen.getByText("none")).toBeInTheDocument();
+      });
       expect(screen.queryByText("healthy")).not.toBeInTheDocument();
-      expect(screen.getByText("none")).toBeInTheDocument();
     });
   });
 });
