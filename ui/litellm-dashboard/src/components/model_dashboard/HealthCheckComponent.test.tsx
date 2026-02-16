@@ -249,4 +249,243 @@ describe("HealthCheckComponent", () => {
       expect(screen.queryByText("healthy")).not.toBeInTheDocument();
     });
   });
+
+  describe("Run All / Run Selected with React Query", () => {
+    it("should call individualModelHealthCheckCall for each model when Run All Checks is clicked", async () => {
+      const modelData = {
+        data: [
+          { model_name: "gpt-4", model_info: { id: "id-1" }, litellm_model_name: "gpt-4" },
+          { model_name: "gpt-4", model_info: { id: "id-2" }, litellm_model_name: "gpt-4" },
+        ],
+      };
+
+      renderWithQueryClient(
+        <HealthCheckComponent
+          accessToken="token"
+          modelData={modelData}
+          all_models_on_proxy={["id-1", "id-2"]}
+          getDisplayModelName={getDisplayModelName}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(mockLatestHealthChecksCall).toHaveBeenCalledWith("token");
+      });
+
+      const runAllButton = screen.getByRole("button", { name: "Run All Checks" });
+      await act(async () => {
+        runAllButton.click();
+      });
+
+      await waitFor(() => {
+        expect(mockIndividualModelHealthCheckCall).toHaveBeenCalledWith("token", "id-1");
+        expect(mockIndividualModelHealthCheckCall).toHaveBeenCalledWith("token", "id-2");
+        expect(mockIndividualModelHealthCheckCall).toHaveBeenCalledTimes(2);
+      });
+    });
+
+    it("should call individualModelHealthCheckCall only for selected models when Run Selected Checks is clicked", async () => {
+      const modelData = {
+        data: [
+          { model_name: "gpt-4", model_info: { id: "id-a" }, litellm_model_name: "gpt-4" },
+          { model_name: "gpt-4", model_info: { id: "id-b" }, litellm_model_name: "gpt-4" },
+          { model_name: "gpt-4", model_info: { id: "id-c" }, litellm_model_name: "gpt-4" },
+        ],
+      };
+
+      renderWithQueryClient(
+        <HealthCheckComponent
+          accessToken="token"
+          modelData={modelData}
+          all_models_on_proxy={["id-a", "id-b", "id-c"]}
+          getDisplayModelName={getDisplayModelName}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(mockLatestHealthChecksCall).toHaveBeenCalledWith("token");
+      });
+
+      const checkboxes = screen.getAllByRole("checkbox");
+      const firstRowCheckbox = checkboxes[1];
+      await act(async () => {
+        firstRowCheckbox.click();
+      });
+
+      const runSelectedButton = screen.getByRole("button", { name: "Run Selected Checks" });
+      await act(async () => {
+        runSelectedButton.click();
+      });
+
+      await waitFor(() => {
+        expect(mockIndividualModelHealthCheckCall).toHaveBeenCalledWith("token", "id-a");
+      });
+      expect(mockIndividualModelHealthCheckCall).toHaveBeenCalledTimes(1);
+    });
+
+    it("should show unhealthy badge when per-model check returns unhealthy response", async () => {
+      const modelData = {
+        data: [
+          { model_name: "gpt-4", model_info: { id: "unhealthy-model" }, litellm_model_name: "gpt-4" },
+        ],
+      };
+
+      mockIndividualModelHealthCheckCall.mockResolvedValue({
+        healthy_count: 0,
+        unhealthy_count: 1,
+        healthy_endpoints: [],
+        unhealthy_endpoints: [{ error: "Connection refused" }],
+      });
+
+      renderWithQueryClient(
+        <HealthCheckComponent
+          accessToken="token"
+          modelData={modelData}
+          all_models_on_proxy={["unhealthy-model"]}
+          getDisplayModelName={getDisplayModelName}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(mockLatestHealthChecksCall).toHaveBeenCalledWith("token");
+      });
+
+      const runButtons = screen.getAllByTestId("run-health-check-btn");
+      await act(async () => {
+        runButtons[0].click();
+      });
+
+      await waitFor(() => {
+        expect(mockIndividualModelHealthCheckCall).toHaveBeenCalledWith("token", "unhealthy-model");
+      });
+      await waitFor(() => {
+        expect(screen.getByText("unhealthy")).toBeInTheDocument();
+      });
+    });
+
+    it("should show unhealthy state when per-model check throws", async () => {
+      const modelData = {
+        data: [
+          { model_name: "gpt-4", model_info: { id: "error-model" }, litellm_model_name: "gpt-4" },
+        ],
+      };
+
+      mockIndividualModelHealthCheckCall.mockRejectedValue(new Error("Network error"));
+
+      renderWithQueryClient(
+        <HealthCheckComponent
+          accessToken="token"
+          modelData={modelData}
+          all_models_on_proxy={["error-model"]}
+          getDisplayModelName={getDisplayModelName}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(mockLatestHealthChecksCall).toHaveBeenCalledWith("token");
+      });
+
+      const runButtons = screen.getAllByTestId("run-health-check-btn");
+      await act(async () => {
+        runButtons[0].click();
+      });
+
+      await waitFor(() => {
+        expect(mockIndividualModelHealthCheckCall).toHaveBeenCalledWith("token", "error-model");
+      });
+      await waitFor(() => {
+        expect(screen.getByText("unhealthy")).toBeInTheDocument();
+      });
+    });
+
+    it("should not fetch latest or run checks when accessToken is null", async () => {
+      const modelData = {
+        data: [
+          { model_name: "gpt-4", model_info: { id: "deployment-1" }, litellm_model_name: "gpt-4" },
+        ],
+      };
+
+      renderWithQueryClient(
+        <HealthCheckComponent
+          accessToken={null}
+          modelData={modelData}
+          all_models_on_proxy={["deployment-1"]}
+          getDisplayModelName={getDisplayModelName}
+        />,
+      );
+
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 50));
+      });
+
+      expect(mockLatestHealthChecksCall).not.toHaveBeenCalled();
+      expect(mockIndividualModelHealthCheckCall).not.toHaveBeenCalled();
+
+      const runAllButton = screen.getByRole("button", { name: "Run All Checks" });
+      await act(async () => {
+        runAllButton.click();
+      });
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 50));
+      });
+      expect(mockIndividualModelHealthCheckCall).not.toHaveBeenCalled();
+    });
+
+    it("should render with empty model list without crashing", async () => {
+      const modelData = { data: [] };
+
+      await act(async () => {
+        renderWithQueryClient(
+          <HealthCheckComponent
+            accessToken="token"
+            modelData={modelData}
+            all_models_on_proxy={[]}
+            getDisplayModelName={getDisplayModelName}
+          />,
+        );
+      });
+
+      expect(screen.getByText("Model Health Status")).toBeInTheDocument();
+      expect(mockLatestHealthChecksCall).toHaveBeenCalledWith("token");
+      const runAllButton = screen.getByRole("button", { name: "Run All Checks" });
+      await act(async () => {
+        runAllButton.click();
+      });
+      expect(mockIndividualModelHealthCheckCall).not.toHaveBeenCalled();
+    });
+
+    it("should invalidate latest health checks after Run All so latest is refetched", async () => {
+      const modelData = {
+        data: [
+          { model_name: "gpt-4", model_info: { id: "only-one" }, litellm_model_name: "gpt-4" },
+        ],
+      };
+
+      renderWithQueryClient(
+        <HealthCheckComponent
+          accessToken="token"
+          modelData={modelData}
+          all_models_on_proxy={["only-one"]}
+          getDisplayModelName={getDisplayModelName}
+        />,
+      );
+
+      await waitFor(() => {
+        expect(mockLatestHealthChecksCall).toHaveBeenCalledWith("token");
+      });
+      const initialCalls = mockLatestHealthChecksCall.mock.calls.length;
+
+      const runAllButton = screen.getByRole("button", { name: "Run All Checks" });
+      await act(async () => {
+        runAllButton.click();
+      });
+
+      await waitFor(() => {
+        expect(mockIndividualModelHealthCheckCall).toHaveBeenCalledWith("token", "only-one");
+      });
+      await waitFor(() => {
+        expect(mockLatestHealthChecksCall.mock.calls.length).toBeGreaterThan(initialCalls);
+      });
+    });
+  });
 });

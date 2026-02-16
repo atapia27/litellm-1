@@ -278,6 +278,7 @@ const HealthCheckComponent: React.FC<HealthCheckComponentProps> = ({
   );
 
   const runAllHealthChecks = useCallback(async () => {
+    if (!accessToken) return;
     const modelsToCheck =
       selectedModelsForHealth.length > 0 ? selectedModelsForHealth : all_models_on_proxy;
     const refetches = modelsToCheck
